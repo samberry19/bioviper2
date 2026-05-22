@@ -1,6 +1,61 @@
+import warnings
 import numpy as np
 import pandas as pd
 from typing import Optional, Tuple, Union
+
+
+# ---------------------------------------------------------------------------
+# PairwiseFrequencies — returned by MSA.pairwise_frequencies()
+# ---------------------------------------------------------------------------
+
+class PairwiseFrequencies:
+    """Joint and single-site character frequencies from an MSA.
+
+    Attributes
+    ----------
+    alphabet : list[str]
+        Non-gap characters present in the alignment (sorted).
+
+    Access patterns
+    ---------------
+    pf[i, j]   → DataFrame (A × A) of joint frequencies for positions i, j
+    pf.site    → DataFrame (L × A) of single-site frequencies
+    pf.array   → raw (L, L, A, A) float32 numpy array
+    """
+
+    def __init__(
+        self,
+        f_ij: np.ndarray,
+        f_i: np.ndarray,
+        alphabet: list,
+        positions: pd.RangeIndex,
+    ):
+        self._f_ij = f_ij          # (L, L, A, A) float32
+        self._f_i = f_i            # (L, A) float32
+        self.alphabet = alphabet
+        self._positions = positions
+
+    def __getitem__(self, key) -> pd.DataFrame:
+        """Return the (A × A) joint frequency DataFrame for position pair (i, j)."""
+        i, j = key
+        return pd.DataFrame(self._f_ij[i, j], index=self.alphabet, columns=self.alphabet)
+
+    @property
+    def site(self) -> pd.DataFrame:
+        """Single-site frequencies: DataFrame of shape (L × A)."""
+        return pd.DataFrame(self._f_i, index=self._positions, columns=self.alphabet)
+
+    @property
+    def array(self) -> np.ndarray:
+        """Raw (L, L, A, A) pairwise frequency array (float32)."""
+        return self._f_ij
+
+    def __repr__(self) -> str:
+        L = self._f_ij.shape[0]
+        return (
+            f"PairwiseFrequencies({L} positions × "
+            f"{len(self.alphabet)}-char alphabet)"
+        )
 
 
 def _label_slice_positions(index: pd.Index, key: slice) -> Tuple[int, int]:
@@ -272,6 +327,136 @@ class MSA:
         H = np.where(n_non_gap > 0, H, np.nan)
 
         return pd.Series(H, index=self._columns, name="entropy")
+
+    def site_frequencies(
+        self,
+        gap_chars=("-", "."),
+        pseudocount: float = 0.0,
+    ) -> pd.DataFrame:
+        """Character frequency at each alignment position.
+
+        Returns a DataFrame of shape (n_positions × alphabet_size).
+        Index: alignment positions. Columns: non-gap characters (sorted).
+        Gap-only columns yield NaN; with a pseudocount they get a valid
+        distribution even when N_eff = 0.
+
+        Parameters
+        ----------
+        gap_chars   : characters treated as gaps; excluded from the alphabet
+                      and from the per-position sequence count.
+        pseudocount : uniform pseudocount λ.  Each character count gets λ/A
+                      added before normalisation; the effective N increases by λ.
+                      A value of 1 is a common choice (equivalent to a flat
+                      Dirichlet prior).
+        """
+        gap_list = list(gap_chars)
+        gap_set = set(gap_chars)
+        is_gap = np.isin(self._array, gap_list)
+        n_eff = (~is_gap).sum(axis=0).astype(float)   # (L,)
+
+        alphabet = sorted(c for c in np.unique(self._array) if c not in gap_set)
+        A = len(alphabet)
+
+        counts = np.stack(
+            [(self._array == c).sum(axis=0) for c in alphabet], axis=1
+        ).astype(float)                                # (L, A)
+
+        if pseudocount > 0:
+            counts += pseudocount / A
+            n_eff = n_eff + pseudocount
+
+        with np.errstate(invalid="ignore"):
+            freqs = np.where(n_eff[:, None] > 0, counts / n_eff[:, None], np.nan)
+
+        return pd.DataFrame(freqs, index=self._columns, columns=alphabet)
+
+    def pairwise_frequencies(
+        self,
+        gap_chars=("-", "."),
+        pseudocount: float = 0.0,
+    ) -> PairwiseFrequencies:
+        """Joint character frequencies for every pair of alignment positions.
+
+        Returns a :class:`PairwiseFrequencies` object.  Access patterns:
+
+        .. code-block:: python
+
+            pf = msa.pairwise_frequencies(pseudocount=1)
+            pf[i, j]   # DataFrame (A × A) for positions i and j
+            pf.site    # DataFrame (L × A) single-site marginals
+            pf.array   # raw (L, L, A, A) float32 numpy array
+
+        Parameters
+        ----------
+        gap_chars   : characters excluded from the alphabet and from N_eff.
+        pseudocount : uniform pseudocount λ.
+                      f_i(a)    = (count_i(a)   + λ/A)   / (N_i  + λ)
+                      f_ij(a,b) = (count_ij(a,b) + λ/A²) / (N_ij + λ)
+                      where N_i / N_ij are non-gap sequence counts.
+
+        Notes
+        -----
+        The result tensor is O(L² × A²) in memory (float32).  For long
+        alignments consider subsetting positions first.
+        """
+        n, L = self.shape
+        gap_list = list(gap_chars)
+        gap_set = set(gap_chars)
+        is_gap = np.isin(self._array, gap_list)
+
+        alphabet = sorted(c for c in np.unique(self._array) if c not in gap_set)
+        A = len(alphabet)
+
+        mem_gb = L * L * A * A * 4 / 1024 ** 3
+        if mem_gb > 2:
+            warnings.warn(
+                f"Pairwise frequency tensor requires ~{mem_gb:.1f} GB. "
+                "Consider subsetting positions first.",
+                stacklevel=2,
+            )
+
+        # Denominators
+        not_gap = (~is_gap).astype(np.float32)   # (n, L)
+        n_i = not_gap.sum(axis=0)                # (L,)
+        n_ij = not_gap.T @ not_gap               # (L, L)  — BLAS
+
+        # Accumulate counts
+        # For each character pair (a, b): count_ij(a,b)[i,j] = A_a[:,i] · A_b[:,j]
+        #   = (A_a.T @ A_b)[i, j]  — one (L×n)@(n×L) matmul per pair.
+        # Exploit symmetry: count_ij(b,a) = count_ij(a,b).T
+        counts_ij = np.zeros((L, L, A, A), dtype=np.float32)
+        counts_i = np.zeros((L, A), dtype=np.float32)
+
+        for ka, a in enumerate(alphabet):
+            A_a = (self._array == a).astype(np.float32)   # (n, L)
+            counts_i[:, ka] = A_a.sum(axis=0)
+
+            for kb in range(ka + 1):
+                A_b = (self._array == alphabet[kb]).astype(np.float32)
+                C = A_a.T @ A_b                            # (L, L)
+                counts_ij[:, :, ka, kb] = C
+                if ka != kb:
+                    counts_ij[:, :, kb, ka] = C.T
+
+        # Apply pseudocount
+        if pseudocount > 0:
+            counts_ij += pseudocount / (A * A)
+            counts_i += pseudocount / A
+            n_ij = n_ij + pseudocount
+            n_i = n_i + pseudocount
+
+        # Normalise
+        with np.errstate(invalid="ignore"):
+            f_ij = np.where(
+                n_ij[:, :, None, None] > 0,
+                counts_ij / n_ij[:, :, None, None],
+                np.nan,
+            ).astype(np.float32)
+            f_i = np.where(
+                n_i[:, None] > 0, counts_i / n_i[:, None], np.nan
+            ).astype(np.float32)
+
+        return PairwiseFrequencies(f_ij, f_i, alphabet, self._columns)
 
     def pairwise_identity(
         self,
