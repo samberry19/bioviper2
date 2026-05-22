@@ -1,6 +1,12 @@
 # bioviper2
 
-Biological sequence analysis toolkit built on numpy and pandas — no biopython dependency.
+Biological sequence analysis toolkit built on numpy and pandas without a biopython dependency.
+
+bioviper2 is a sequel to my previous package bioviper, which wrapped biopython functions for processing MSAs, protein structures, and phylogenetic trees with some additional code to make them more usable. I have unfortunately stopped updating this package, partly because dealing with biopython has become unwieldy and I've come to feel that it is more parsimonious to just build directly on top of pandas and inherit directly from dataframe structues rather than create some Frankenstein of biopython and my own whims as a 2nd-year PhD student.
+
+The key goal of this package is just to have a centralized collection of utilities to read and write sequence data from a variety of formats to a pandas dataframe, and additionally to define a data class that stores both the alignment as a dataframe and all of its associated metadata as a secondary data frame.
+
+This package was developed with help from claude code.
 
 ## Features
 
