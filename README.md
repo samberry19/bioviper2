@@ -12,7 +12,7 @@ This package was developed with help from claude code.
 
 - **MSA class** — memory-efficient multiple sequence alignment backed by a numpy `U1` array, with pandas-style `.loc`/`.iloc` indexing
 - **I/O** — read and write FASTA, Stockholm, Clustal, A3M; unaligned sequences to/from DataFrame; CSV export
-- **Analysis** — per-position conservation and Shannon entropy, per-sequence coverage, pairwise identity matrix
+- **Analysis** — per-position conservation, Shannon entropy, and alignment depth; per-sequence occupancy; pairwise identity matrix
 
 ## Installation
 
@@ -35,7 +35,8 @@ msa.iloc[:, 0:50]                # first 50 positions
 # Analysis
 msa.conservation()               # per-position fraction identical
 msa.entropy()                    # per-position Shannon entropy (bits)
-msa.coverage()                   # per-sequence fraction non-gap
+msa.coverage()                   # per-position depth (fraction of sequences non-gap)
+msa.coverage(per='sequence')     # per-sequence occupancy (fraction of columns non-gap)
 msa.pairwise_identity()          # n×n identity DataFrame
 
 # Load unaligned sequences

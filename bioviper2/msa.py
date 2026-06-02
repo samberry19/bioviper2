@@ -224,6 +224,8 @@ class MSA:
         else:
             self.metadata = None
 
+        self._weights: Optional[np.ndarray] = None  # None → uniform 1.0
+
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
@@ -243,6 +245,34 @@ class MSA:
     @property
     def index(self) -> pd.Index:
         return self._index
+
+    @property
+    def weights(self) -> pd.Series:
+        """Sequence weights as a Series indexed by sequence ID.
+
+        Returns uniform 1.0 for all sequences until :meth:`compute_weights`
+        (or a manual assignment) has been called.
+        """
+        vals = np.ones(self.n_seqs, dtype=np.float64) if self._weights is None else self._weights.astype(np.float64)
+        return pd.Series(vals, index=self._index, name="weight")
+
+    @weights.setter
+    def weights(self, values) -> None:
+        arr = np.asarray(values, dtype=np.float64)
+        if arr.shape != (self.n_seqs,):
+            raise ValueError(f"weights must have length {self.n_seqs}, got {arr.shape}")
+        self._weights = arr
+
+    @property
+    def n_eff(self) -> float:
+        """Effective number of sequences (sum of weights)."""
+        return float(self.weights.sum())
+
+    def _effective_weights(self) -> np.ndarray:
+        """Return float32 weight vector of length n_seqs."""
+        if self._weights is None:
+            return np.ones(self.n_seqs, dtype=np.float32)
+        return self._weights.astype(np.float32)
 
     # ------------------------------------------------------------------
     # Indexers
@@ -265,6 +295,25 @@ class MSA:
         For large MSAs this is expensive — prefer .iloc / .loc for subsets."""
         return pd.DataFrame(self._array, index=self._index, columns=self._columns)
 
+    def select_uppercase_columns(self) -> "MSA":
+        """Return a new MSA containing only columns that have at least one uppercase character.
+
+        In HMM-based alignments (e.g. from hmmalign / hmmbuild), match-state
+        columns carry uppercase residues while insert-state columns carry
+        lowercase residues.  This method retains only the match-state columns,
+        discarding pure-lowercase (insert) columns.
+
+        Sequence weights and metadata are preserved unchanged (they are
+        per-sequence, not per-column).
+        """
+        is_upper = np.char.isupper(self._array)   # (n, L) bool; False for gaps/lowercase
+        keep = is_upper.any(axis=0)               # (L,) — True for match-state columns
+
+        new_msa = MSA(self._array[:, keep], index=self._index, metadata=self.metadata)
+        if self._weights is not None:
+            new_msa._weights = self._weights.copy()
+        return new_msa
+
     # ------------------------------------------------------------------
     # Analysis
     # ------------------------------------------------------------------
@@ -273,13 +322,44 @@ class MSA:
         """Boolean array (n_seqs × n_positions), True where character is a gap."""
         return np.isin(self._array, list(gap_chars))
 
-    def coverage(self, gap_chars=("-", ".")) -> pd.Series:
-        """Fraction of non-gap positions in each sequence.
+    def coverage(self, gap_chars=("-", "."), per: str = "position") -> pd.Series:
+        """Alignment coverage, either per-position (depth) or per-sequence (occupancy).
 
-        Returns a Series indexed by sequence ID with values in [0, 1].
+        Parameters
+        ----------
+        gap_chars : characters treated as gaps.
+        per       : ``'position'`` (default) or ``'sequence'``.
+
+            ``'position'``
+                **Depth** — for each alignment column, the fraction of sequences
+                that carry a non-gap character.  Returns a Series indexed by
+                position with values in [0, 1].
+
+            ``'sequence'``
+                **Occupancy** — for each sequence, the fraction of alignment
+                columns that are non-gap in that sequence.  Returns a Series
+                indexed by sequence ID with values in [0, 1].
+
+                Note: this is *not* the same as the fraction of the original
+                (unaligned) sequence that is covered by the alignment; computing
+                that requires knowing the unaligned sequence lengths, which are
+                not stored in the MSA.
+
+        Raises
+        ------
+        ValueError if *per* is not ``'position'`` or ``'sequence'``.
         """
-        n_non_gap = (~self._gap_mask(gap_chars)).sum(axis=1).astype(float)
-        return pd.Series(n_non_gap / self.n_positions, index=self._index, name="coverage")
+        if per not in ("position", "sequence"):
+            raise ValueError(f"per must be 'position' or 'sequence', got {per!r}")
+
+        is_gap = self._gap_mask(gap_chars)
+
+        if per == "position":
+            depth = (~is_gap).sum(axis=0).astype(float) / self.n_seqs
+            return pd.Series(depth, index=self._columns, name="coverage")
+        else:
+            occupancy = (~is_gap).sum(axis=1).astype(float) / self.n_positions
+            return pd.Series(occupancy, index=self._index, name="occupancy")
 
     def conservation(self, gap_chars=("-", ".")) -> pd.Series:
         """Fraction of non-gap sequences carrying the modal character at each position.
@@ -352,14 +432,17 @@ class MSA:
         gap_list = list(gap_chars)
         gap_set = set(gap_chars)
         is_gap = np.isin(self._array, gap_list)
-        n_eff = (~is_gap).sum(axis=0).astype(float)   # (L,)
+
+        w = self._effective_weights()                          # (n,) float32
+        not_gap = (~is_gap).astype(np.float32)                 # (n, L)
+        n_eff = (w @ not_gap).astype(float)                   # (L,) weighted
 
         alphabet = sorted(c for c in np.unique(self._array) if c not in gap_set)
         A = len(alphabet)
 
         counts = np.stack(
-            [(self._array == c).sum(axis=0) for c in alphabet], axis=1
-        ).astype(float)                                # (L, A)
+            [w @ (self._array == c).astype(np.float32) for c in alphabet], axis=1
+        ).astype(float)                                        # (L, A) weighted
 
         if pseudocount > 0:
             counts += pseudocount / A
@@ -416,24 +499,26 @@ class MSA:
             )
 
         # Denominators
+        w = self._effective_weights()             # (n,) float32
         not_gap = (~is_gap).astype(np.float32)   # (n, L)
-        n_i = not_gap.sum(axis=0)                # (L,)
-        n_ij = not_gap.T @ not_gap               # (L, L)  — BLAS
+        wn = not_gap * w[:, None]                # (n, L) weighted not-gap
+        n_i = wn.sum(axis=0)                     # (L,)
+        n_ij = wn.T @ not_gap                    # (L, L)  — BLAS, symmetric
 
         # Accumulate counts
-        # For each character pair (a, b): count_ij(a,b)[i,j] = A_a[:,i] · A_b[:,j]
-        #   = (A_a.T @ A_b)[i, j]  — one (L×n)@(n×L) matmul per pair.
+        # count_ij(a,b)[i,j] = sum_s w_s * A_a[s,i] * A_b[s,j]
+        #   = ((A_a * w[:,None]).T @ A_b)[i, j]
         # Exploit symmetry: count_ij(b,a) = count_ij(a,b).T
         counts_ij = np.zeros((L, L, A, A), dtype=np.float32)
         counts_i = np.zeros((L, A), dtype=np.float32)
 
         for ka, a in enumerate(alphabet):
             A_a = (self._array == a).astype(np.float32)   # (n, L)
-            counts_i[:, ka] = A_a.sum(axis=0)
+            counts_i[:, ka] = w @ A_a                      # weighted marginal
 
             for kb in range(ka + 1):
                 A_b = (self._array == alphabet[kb]).astype(np.float32)
-                C = A_a.T @ A_b                            # (L, L)
+                C = (A_a * w[:, None]).T @ A_b             # (L, L) weighted
                 counts_ij[:, :, ka, kb] = C
                 if ka != kb:
                     counts_ij[:, :, kb, ka] = C.T
@@ -525,6 +610,40 @@ class MSA:
 
         return pd.DataFrame(identity, index=self._index, columns=self._index)
 
+    def compute_weights(
+        self,
+        threshold: float = 0.8,
+        gap_chars=("-", "."),
+        mem_limit_mb: int = 512,
+    ) -> pd.Series:
+        """Compute and store similarity-threshold sequence weights.
+
+        For each sequence i, k_i = number of sequences (including i itself)
+        whose pairwise identity with i is >= *threshold*.  The weight is then
+        w_i = 1/k_i.  Sequences with no comparable partners (NaN identity)
+        are treated as singletons (k_i = 1, w_i = 1).
+
+        After calling this method, :attr:`weights` and :attr:`n_eff` reflect
+        the new values, and both :meth:`site_frequencies` and
+        :meth:`pairwise_frequencies` will use them automatically.
+
+        Parameters
+        ----------
+        threshold   : identity threshold (default 0.8).
+        gap_chars   : forwarded to :meth:`pairwise_identity`.
+        mem_limit_mb: forwarded to :meth:`pairwise_identity`.
+
+        Returns
+        -------
+        pd.Series of weights (also stored as ``self.weights``).
+        """
+        pid = self.pairwise_identity(gap_chars=gap_chars, mem_limit_mb=mem_limit_mb)
+        pid_arr = pid.to_numpy(dtype=np.float32, na_value=0.0)
+        k = (pid_arr >= threshold).sum(axis=1).astype(np.float64)
+        k = np.maximum(k, 1.0)
+        self._weights = 1.0 / k
+        return self.weights
+
     def to_sequences(self) -> pd.Series:
         """Return each sequence as a string, indexed by sequence ID."""
         return pd.Series(
@@ -546,4 +665,5 @@ class MSA:
             if self.metadata is not None
             else ""
         )
-        return f"MSA({self.n_seqs} sequences × {self.n_positions} positions{meta_info})"
+        weight_info = f", N_eff={self.n_eff:.1f}" if self._weights is not None else ""
+        return f"MSA({self.n_seqs} sequences × {self.n_positions} positions{meta_info}{weight_info})"
