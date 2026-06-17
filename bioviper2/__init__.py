@@ -8,6 +8,7 @@ from .io import (
     read_clustal, write_clustal,
     read_a3m, write_a3m,
 )
+from .tools import hmmalign, hmmbuild, hmmsearch
 
 __all__ = [
     "MSA",
@@ -18,4 +19,5 @@ __all__ = [
     "read_stockholm", "write_stockholm",
     "read_clustal", "write_clustal",
     "read_a3m", "write_a3m",
+    "hmmalign", "hmmbuild", "hmmsearch",
 ]
