@@ -117,7 +117,7 @@ class _IlocIndexer:
             return pd.Series(
                 row_data[:, int(col_key)],
                 index=self._msa._index[row_key],
-                name=int(col_key),
+                name=self._msa._columns[int(col_key)],
             )
 
         return pd.DataFrame(
@@ -127,15 +127,49 @@ class _IlocIndexer:
         )
 
 
-class _LocIndexer:
-    """Label-based row indexer: msa.loc[seq_ids, cols].
+def _resolve_col_loc(col_index: pd.Index, col_key):
+    """Translate a .loc column key to (numpy_indexer, col_labels, is_scalar).
 
-    Row keys are sequence ID labels; column keys are integer positions.
+    Performs label-based lookup so that both integer keys on a RangeIndex
+    (backward-compatible) and named column labels on a custom Index work.
+    """
+    if isinstance(col_key, slice):
+        if col_key == slice(None):
+            return slice(None), col_index, False
+        start, stop = _label_slice_positions(col_index, col_key)
+        col_np = slice(start, stop)
+        return col_np, col_index[col_np], False
+
+    if isinstance(col_key, (list, np.ndarray)):
+        col_pos = col_index.get_indexer(col_key)
+        missing = [k for k, p in zip(col_key, col_pos) if p == -1]
+        if missing:
+            raise KeyError(f"Column labels not found: {missing}")
+        return col_pos, col_index[col_pos], False
+
+    # scalar label
+    c_pos = col_index.get_loc(col_key)
+    if not isinstance(c_pos, (int, np.integer)):
+        raise ValueError(f"Column label {col_key!r} is not unique")
+    return int(c_pos), None, True
+
+
+class _LocIndexer:
+    """Label-based indexer: msa.loc[seq_ids, col_labels].
+
+    Both rows (sequence IDs) and columns (position labels) use label-based
+    lookup.  When column_index is the default RangeIndex, integer column keys
+    behave identically to before (RangeIndex.get_loc(n) == n).
+
     Supported row key forms:
       - str                → single sequence (returns Series)
       - 'id1':'id3' slice  → inclusive label slice (returns DataFrame)
       - list / array       → explicit list of IDs (returns DataFrame)
-    Column key can be an int (returns Series), slice, or list.
+
+    Supported column key forms (same shapes):
+      - scalar label       → column Series (or single char with scalar row)
+      - label slice        → subset (inclusive, label-based)
+      - list / array       → explicit list of column labels
     """
 
     def __init__(self, msa: "MSA"):
@@ -147,25 +181,27 @@ class _LocIndexer:
         else:
             row_key, col_key = key, slice(None)
 
-        scalar_col = isinstance(col_key, (int, np.integer))
+        col_np, col_labels, scalar_col = _resolve_col_loc(
+            self._msa._columns, col_key
+        )
 
-        # ---- single label ------------------------------------------------
+        # ---- single row label --------------------------------------------
         if isinstance(row_key, str):
             row_pos = int(self._msa._index.get_loc(row_key))
             row_data = self._msa._array[row_pos]  # 1D
             if scalar_col:
-                return row_data[int(col_key)].item()
+                return row_data[col_np].item()
             return pd.Series(
-                row_data[col_key],
-                index=self._msa._columns[col_key],
+                row_data[col_np],
+                index=col_labels,
                 name=row_key,
             )
 
         # ---- label slice -------------------------------------------------
         if isinstance(row_key, slice):
             start, stop = _label_slice_positions(self._msa._index, row_key)
-            row_pos = slice(start, stop)
-            row_idx = self._msa._index[row_pos]
+            row_np = slice(start, stop)
+            row_idx = self._msa._index[row_np]
 
         # ---- array-like of labels ----------------------------------------
         else:
@@ -173,22 +209,22 @@ class _LocIndexer:
             missing = np.asarray(row_key)[int_pos == -1]
             if len(missing):
                 raise KeyError(f"Sequence IDs not found: {missing.tolist()}")
-            row_pos = int_pos
-            row_idx = self._msa._index[row_pos]
+            row_np = int_pos
+            row_idx = self._msa._index[row_np]
 
-        row_data = self._msa._array[row_pos]  # 2D
+        row_data = self._msa._array[row_np]  # 2D
 
         if scalar_col:
             return pd.Series(
-                row_data[:, int(col_key)],
+                row_data[:, col_np],
                 index=row_idx,
-                name=int(col_key),
+                name=self._msa._columns[col_np],
             )
 
         return pd.DataFrame(
-            row_data[:, col_key],
+            row_data[:, col_np],
             index=row_idx,
-            columns=self._msa._columns[col_key],
+            columns=col_labels,
         )
 
 
@@ -245,6 +281,37 @@ class MSA:
     @property
     def index(self) -> pd.Index:
         return self._index
+
+    @property
+    def column_index(self) -> pd.Index:
+        """Column labels for each alignment position.
+
+        By default this is a :class:`~pandas.RangeIndex` (0, 1, 2, …).  Assign
+        any sequence of labels of length ``n_positions`` to name the columns
+        according to a standardised numbering scheme (e.g. Kabat, IMGT,
+        Ballesteros–Weinstein)::
+
+            msa.column_index = kabat_numbers   # list, array, or pd.Index
+
+        Once named, columns can be selected by label with ``.loc``::
+
+            msa.loc[:, "H50"]          # all sequences at position H50
+            msa.loc["seq1", "H1":"H5"] # residues H1–H5 for seq1 (inclusive)
+            msa.loc[:, ["H1", "H50"]]  # two named columns
+
+        ``.iloc`` continues to use integer positions regardless.
+        """
+        return self._columns
+
+    @column_index.setter
+    def column_index(self, names) -> None:
+        idx = pd.Index(names)
+        if len(idx) != self.n_positions:
+            raise ValueError(
+                f"column_index length {len(idx)} does not match "
+                f"n_positions {self.n_positions}"
+            )
+        self._columns = idx
 
     @property
     def weights(self) -> pd.Series:
@@ -312,6 +379,8 @@ class MSA:
         new_msa = MSA(self._array[:, keep], index=self._index, metadata=self.metadata)
         if self._weights is not None:
             new_msa._weights = self._weights.copy()
+        if not isinstance(self._columns, pd.RangeIndex):
+            new_msa._columns = self._columns[keep]
         return new_msa
 
     # ------------------------------------------------------------------
@@ -666,4 +735,12 @@ class MSA:
             else ""
         )
         weight_info = f", N_eff={self.n_eff:.1f}" if self._weights is not None else ""
-        return f"MSA({self.n_seqs} sequences × {self.n_positions} positions{meta_info}{weight_info})"
+        col_info = (
+            f", column_index={self._columns.dtype.name}"
+            if not isinstance(self._columns, pd.RangeIndex)
+            else ""
+        )
+        return (
+            f"MSA({self.n_seqs} sequences × {self.n_positions} positions"
+            f"{col_info}{meta_info}{weight_info})"
+        )
