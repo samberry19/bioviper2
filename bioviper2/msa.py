@@ -721,6 +721,38 @@ class MSA:
             name="sequence",
         )
 
+    def to_unaligned_sequences(self, gap_chars=("-", ".")) -> pd.Series:
+        """Return each sequence with gap characters removed, indexed by sequence ID.
+
+        Strips all characters in *gap_chars* from every row, yielding the
+        original unaligned sequences.  The result is a Series of strings with
+        varying lengths — i.e. the same format returned by
+        :func:`~bioviper2.read_fasta_sequences`.
+
+        Parameters
+        ----------
+        gap_chars : characters treated as gaps (default ``('-', '.')``)
+
+        Examples
+        --------
+        Round-trip to a FASTA file::
+
+            seqs = msa.to_unaligned_sequences()
+            bioviper2.write_sequences(seqs.to_frame(), "ungapped.fasta")
+
+        Preserve metadata alongside sequences::
+
+            df = msa.to_unaligned_sequences().to_frame()
+            if msa.metadata is not None:
+                df = df.join(msa.metadata)
+        """
+        gap_set = set(gap_chars)
+        return pd.Series(
+            ["".join(c for c in row if c not in gap_set) for row in self._array],
+            index=self._index,
+            name="sequence",
+        )
+
     # ------------------------------------------------------------------
     # Dunder
     # ------------------------------------------------------------------
