@@ -15,6 +15,44 @@ if TYPE_CHECKING:
     import logomaker as _lm
 
 
+# Characters that could appear as column labels in a sequence logo.
+# Used to detect which axis of a 2-D matrix is the alphabet axis.
+_ALPHABET_CHARS = frozenset(
+    "ACDEFGHIKLMNPQRSTVWYBXZUacdefghiklmnpqrstvwybxzu*"  # amino acids
+    "ACGTURYSWKMBDHVNacgturyswkmbdhvn"                   # nucleotides / IUPAC
+    "-."                                                   # gap characters
+)
+
+
+def _is_char_axis(labels) -> bool:
+    """Return True if *labels* look like a single-character sequence alphabet.
+
+    Checks that every label is a one-character string belonging to a known
+    amino-acid or nucleotide alphabet.  This is more reliable than using
+    axis length as a proxy for orientation.
+    """
+    strs = [str(lbl) for lbl in labels]
+    return bool(strs) and all(len(s) == 1 for s in strs) and set(strs).issubset(_ALPHABET_CHARS)
+
+
+def _orient_logo_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Return *df* in logomaker orientation: rows = positions, columns = characters.
+
+    Detects which axis carries single-character alphabet labels and transposes
+    if necessary.  Falls back to the input orientation when the axis cannot be
+    determined (e.g. both axes or neither axis look like an alphabet).
+    """
+    cols_are_chars = _is_char_axis(df.columns)
+    rows_are_chars = _is_char_axis(df.index)
+
+    if cols_are_chars and not rows_are_chars:
+        return df          # already correct
+    if rows_are_chars and not cols_are_chars:
+        return df.T        # alphabet on row axis → transpose
+    # Ambiguous or unrecognised: return as-is and let logomaker report the error
+    return df
+
+
 def _to_logo_df(matrix) -> pd.DataFrame:
     """Convert various matrix types to a logomaker-compatible DataFrame.
 
@@ -22,7 +60,7 @@ def _to_logo_df(matrix) -> pd.DataFrame:
     whose columns are single characters (the alphabet).
     """
     if isinstance(matrix, pd.DataFrame):
-        return matrix.copy()
+        return _orient_logo_df(matrix.copy())
 
     # xarray DataArray — import lazily so xarray is also a soft dependency
     try:
@@ -36,13 +74,7 @@ def _to_logo_df(matrix) -> pd.DataFrame:
                     f"DataArray must be 2-D (positions × characters), "
                     f"got {matrix.ndim} dimensions."
                 )
-            df = matrix.to_pandas()
-            # Ensure orientation: rows = positions (many), cols = alphabet (few).
-            # Heuristic: if the columns look like single characters, we're good;
-            # otherwise transpose.
-            if df.shape[1] > df.shape[0]:
-                df = df.T
-            return df
+            return _orient_logo_df(matrix.to_pandas())
 
     raise TypeError(
         f"matrix must be a pd.DataFrame or xr.DataArray, "
