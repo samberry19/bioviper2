@@ -4,10 +4,13 @@ from typing import Union
 import pandas as pd
 
 from ..msa import MSA
+from ..structure import Structure
 from .fasta import read_fasta, write_fasta, read_fasta_sequences, write_fasta_sequences
 from .stockholm import read_stockholm, write_stockholm
 from .clustal import read_clustal, write_clustal
 from .a3m import read_a3m, write_a3m
+from .pdb import read_pdb, write_pdb
+from .mmcif import read_mmcif, write_mmcif
 
 __all__ = [
     "read_fasta", "write_fasta",
@@ -17,7 +20,61 @@ __all__ = [
     "read_a3m", "write_a3m",
     "read", "write",
     "read_sequences", "write_sequences",
+    "read_pdb", "write_pdb",
+    "read_mmcif", "write_mmcif",
+    "read_structure", "write_structure",
 ]
+
+# --- structure readers/writers (→ Structure) --------------------------------
+
+_STRUCTURE_READERS = {
+    ".pdb":   read_pdb,
+    ".ent":   read_pdb,
+    ".cif":   read_mmcif,
+    ".mmcif": read_mmcif,
+}
+
+_STRUCTURE_WRITERS = {
+    ".pdb":   write_pdb,
+    ".ent":   write_pdb,
+    ".cif":   write_mmcif,
+    ".mmcif": write_mmcif,
+}
+
+
+def read_structure(filepath: Union[str, Path]) -> Structure:
+    """Auto-detect format from extension and parse a structure file.
+
+    Supported extensions: ``.pdb``, ``.ent`` (PDB format), ``.cif``,
+    ``.mmcif`` (mmCIF format).
+    """
+    ext = Path(filepath).suffix.lower()
+    reader = _STRUCTURE_READERS.get(ext)
+    if reader is None:
+        raise ValueError(
+            f"Unrecognised extension '{ext}'. Supported: {sorted(_STRUCTURE_READERS)}"
+        )
+    return reader(filepath)
+
+
+def write_structure(
+    structure: Structure,
+    filepath: Union[str, Path],
+    **kwargs,
+) -> None:
+    """Auto-detect format from extension and write a structure file.
+
+    Extra keyword arguments are forwarded to the format writer
+    (e.g. ``renumber`` for PDB).
+    """
+    ext = Path(filepath).suffix.lower()
+    writer = _STRUCTURE_WRITERS.get(ext)
+    if writer is None:
+        raise ValueError(
+            f"Unrecognised extension '{ext}'. Supported: {sorted(_STRUCTURE_WRITERS)}"
+        )
+    writer(structure, filepath, **kwargs)
+
 
 # --- alignment readers/writers (→ MSA) -------------------------------------
 
