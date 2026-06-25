@@ -115,8 +115,6 @@ def map_alignment_to_structure(
     >>> # Distance between columns 10 and 20 of the alignment:
     >>> dm.values[mapping[10], mapping[20]]   # only if both >= 0
     """
-    from .align import align as _align
-
     gap_set = set(gap_chars)
 
     # ------------------------------------------------------------------
@@ -191,6 +189,8 @@ def map_alignment_to_structure(
                 out[c] = k
 
         else:  # "align"
+            from .align import align as _align
+
             result_msa = _align(
                 aln_seq_upper, struct_seq,
                 mode="global",

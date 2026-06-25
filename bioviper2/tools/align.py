@@ -295,6 +295,12 @@ def _traceback(s1: str, s2: str,
 
     while i > 0 or j > 0:
         if state == 0:  # M state: diagonal move
+            # Boundary guards: if one sequence is exhausted, force to the
+            # correct gap state rather than letting i/j go negative.
+            if i <= 0:
+                state = 2; continue   # drain remaining s2 as gaps in s1
+            if j <= 0:
+                state = 1; continue   # drain remaining s1 as gaps in s2
             # local: stop if we've reached the 0-origin
             if local and M[i, j] <= 0:
                 break
@@ -306,6 +312,8 @@ def _traceback(s1: str, s2: str,
             state = prev
 
         elif state == 1:  # Ix state: gap in seq2
+            if i <= 0:
+                state = 2; continue   # s1 exhausted — drain s2 instead
             if local and Ix[i, j] <= 0:
                 break
             a1.append(s1[i - 1])
@@ -315,6 +323,8 @@ def _traceback(s1: str, s2: str,
             state = 0 if prev == 0 else 1
 
         else:  # Iy state: gap in seq1
+            if j <= 0:
+                state = 1; continue   # s2 exhausted — drain s1 instead
             if local and Iy[i, j] <= 0:
                 break
             a1.append("-")
