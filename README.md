@@ -11,8 +11,10 @@ This package was developed with help from claude code.
 ## Features
 
 - **MSA class** — memory-efficient multiple sequence alignment backed by a numpy `U1` array, with pandas-style `.loc`/`.iloc` indexing
-- **Structure class** — protein structure backed by a numpy coordinate array and a parallel atom table; reads PDB and mmCIF; `.select()` by chain, residue, atom, element, or hetero flag
+- **Structure class** — protein structure backed by a numpy coordinate array and a parallel atom table; reads PDB and mmCIF; `.select()` by chain, residue, atom, element, or hetero flag; `.sequence()` for one-letter residue extraction
 - **DistanceMatrix class** — labeled pairwise distance matrix with re-selectable axes and MultiIndex pandas access; supports CA–CA, CB–CB, all-atom, and residue minimum-distance modes
+- **Alignment↔structure mapping** — `map_alignment_to_structure()` maps alignment columns to CA distance-matrix rows, handling gaps, missing residues, and sequence fragments; foundational primitive for evolutionary structural analyses
+- **iRMSD** — superposition-free alignment quality metric; compares intramolecular Cα–Cα distances across structures without superposition; returns global score, per-column local profile, and pairwise structure matrix
 - **I/O** — read and write FASTA, Stockholm, Clustal, A3M, PDB, mmCIF; unaligned sequences to/from DataFrame; CSV export
 - **Analysis** — per-position conservation, Shannon entropy, and alignment depth; per-sequence occupancy; pairwise identity matrix
 
@@ -101,6 +103,51 @@ dm.select(resi=2)                     # filters by author res_seq, not array ind
 
 # atom-level matrix allows atom/element/hetero filtering too
 s.distance_matrix("all_atom").select(chain="A", atom="CA")
+```
+
+## Alignment–structure mapping and iRMSD
+
+```python
+# Get the one-letter sequence of a structure (aligned with CA distance matrix)
+s = bv.read_pdb("structure.pdb")
+s.sequence()                       # 'MAKVFGR...' (all residues, all chains)
+s.select(chain="A").sequence()     # chain A only
+s.sequence(ca_only=True)           # one char per CA row — 1:1 with distance_matrix("ca")
+
+# Map alignment columns → CA distance-matrix row indices (sentinel -1 for gaps/missing)
+msa = bv.read("alignment.fasta")
+mapping = bv.map_alignment_to_structure(msa, "seq1", s)
+# mapping[c] = row index into s.distance_matrix("ca").values, or -1 if column c is a gap
+
+# Options: restrict to a chain, choose mapping strategy
+mapping = bv.map_alignment_to_structure(
+    msa, "seq1", s,
+    chain="A",              # only chain A corresponds to this sequence
+    strategy="auto",        # "auto" | "positional" | "align" (default: auto)
+    return_type="series",   # return pandas Series indexed by column_index
+)
+
+# Superposition-free iRMSD: compare alignments by structural agreement
+structures = {
+    "seq1": bv.read_pdb("s1.pdb"),
+    "seq2": bv.read_pdb("s2.pdb"),
+    "seq3": bv.read_pdb("s3.pdb"),
+}
+result = bv.irmsd(msa, structures)
+
+result.global_               # global iRMSD score (lower = better) — sqrt(ΣS/N) pooled
+result.per_column            # pd.Series: per-column local iRMSD (NaN at gap-only columns)
+result.pairwise              # seq_id × seq_id DataFrame of pairwise iRMSD scores
+result.n_pairs_evaluated     # number of Cα pair comparisons counted
+
+# Options
+result = bv.irmsd(
+    msa, structures,
+    radius=10.0,             # neighbourhood sphere in Å (T-Coffee default)
+    mode="ca",               # distance_matrix mode ('ca', 'cb', …)
+    chains={"seq1": "A"},    # restrict each structure to a chain
+    models={"seq1": 1},      # select model for multi-model structures
+)
 ```
 
 ## Supported formats

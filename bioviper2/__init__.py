@@ -12,7 +12,13 @@ from .io import (
     read_mmcif, write_mmcif,
     read_structure, write_structure,
 )
-from .tools import hmmalign, hmmbuild, hmmsearch, align, sequence_logo
+from .tools import (
+    hmmalign, hmmbuild, hmmsearch,
+    align,
+    sequence_logo,
+    map_alignment_to_structure,
+    irmsd, IRMSDResult,
+)
 
 __all__ = [
     "MSA",
@@ -29,4 +35,6 @@ __all__ = [
     "read_mmcif", "write_mmcif",
     "read_structure", "write_structure",
     "hmmalign", "hmmbuild", "hmmsearch", "align", "sequence_logo",
+    "map_alignment_to_structure",
+    "irmsd", "IRMSDResult",
 ]

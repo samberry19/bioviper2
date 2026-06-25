@@ -4,6 +4,45 @@ from typing import Optional, Union
 
 
 # ---------------------------------------------------------------------------
+# Amino-acid three-letter → one-letter map
+# ---------------------------------------------------------------------------
+
+# Standard 20 amino acids plus common modified/non-standard residues.
+# Unknown residues map to 'X'.
+_AA3TO1: dict = {
+    # Standard
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+    "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
+    "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
+    "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+    # Common non-standard
+    "MSE": "M",  # selenomethionine
+    "SEC": "U",  # selenocysteine
+    "PYL": "O",  # pyrrolysine
+    # His protonation states (CHARMM / AMBER)
+    "HSD": "H", "HSE": "H", "HSP": "H", "HIE": "H", "HID": "H", "HIP": "H",
+    # Phosphorylated
+    "SEP": "S", "TPO": "T", "PTR": "Y",
+    # Other common modified residues
+    "MLY": "K",  # N-methyl-lysine
+    "CSO": "C",  # S-hydroxycysteine
+    "CME": "C",  # S,S-(2-hydroxyethyl)thiocysteine
+    "OCS": "C",  # cysteinesulfenic acid
+    "KCX": "K",  # lysine NZ-carboxylic acid
+    "LLP": "K",  # lysine-pyridoxal-5'-phosphate
+}
+_UNKNOWN_AA = "X"
+
+
+def _res_name_to_one(res_name: str) -> str:
+    """Convert a three-letter residue name to a one-letter code.
+
+    Unknown residues return ``'X'``.
+    """
+    return _AA3TO1.get(str(res_name).upper().strip(), _UNKNOWN_AA)
+
+
+# ---------------------------------------------------------------------------
 # _SCHEMA — fixed ordered column defaults
 # ---------------------------------------------------------------------------
 
@@ -400,6 +439,84 @@ class Structure:
         new_coords = self._coords[idx]
         new_atoms = self.atoms[idx].reset_index(drop=True)
         return Structure(new_coords, new_atoms, validate=False)
+
+    # ------------------------------------------------------------------
+    # Sequence
+    # ------------------------------------------------------------------
+
+    def sequence(self, *, ca_only: bool = False) -> str:
+        """Return the one-letter residue sequence in :attr:`residues` order.
+
+        All chains are concatenated (no separator).  Unknown three-letter
+        residue names are mapped to ``'X'``.
+
+        Parameters
+        ----------
+        ca_only : bool, default False
+            When ``True``, only residues that have a Cα atom are included.
+            The resulting string is **byte-for-byte aligned with the row order
+            of** ``distance_matrix("ca")`` — the k-th character corresponds to
+            row k of the CA distance matrix.
+
+        Returns
+        -------
+        str
+            One character per residue.
+
+        Examples
+        --------
+        >>> s.sequence()                 # all residues, all chains
+        'MAKVFGR...'
+        >>> s.select(chain="A").sequence()
+        'MAKVFGR'
+        >>> s.sequence(ca_only=True)     # aligned with distance_matrix("ca")
+        'MAKVFGR'
+        """
+        if ca_only:
+            # Replicate exactly what distance_matrix("ca") does so the order
+            # is guaranteed identical.
+            ca_atoms = self.select(atom="CA")
+            res_names = ca_atoms.atoms["res_name"]
+        else:
+            res_names = self.residues["res_name"]
+        return "".join(_res_name_to_one(rn) for rn in res_names)
+
+    def sequence_residues(self, *, ca_only: bool = False) -> pd.DataFrame:
+        """Return a residue table with an additional ``one_letter`` column.
+
+        The result is :attr:`residues` (or its CA-filtered version) augmented
+        with a ``'one_letter'`` column, so each character in :meth:`sequence`
+        has a corresponding row carrying its ``(chain_id, res_seq, icode)``
+        back-mapping.
+
+        Parameters
+        ----------
+        ca_only : bool, default False
+            When ``True``, restrict to CA-bearing residues (parallel to
+            ``sequence(ca_only=True)``).
+
+        Returns
+        -------
+        pandas.DataFrame
+            Columns: ``model``, ``chain_id``, ``res_seq``, ``icode``,
+            ``res_name``, ``one_letter``.  Fresh :class:`~pandas.RangeIndex`.
+
+        Examples
+        --------
+        >>> sr = s.select(chain="A").sequence_residues()
+        >>> sr[["res_seq", "res_name", "one_letter"]]
+        """
+        if ca_only:
+            ca_atoms = self.select(atom="CA")
+            res_table = ca_atoms.atoms[
+                ["model", "chain_id", "res_seq", "icode", "res_name"]
+            ].reset_index(drop=True).copy()
+        else:
+            res_table = self.residues.copy()
+        res_table["one_letter"] = [
+            _res_name_to_one(rn) for rn in res_table["res_name"]
+        ]
+        return res_table
 
     # ------------------------------------------------------------------
     # Distance matrix
