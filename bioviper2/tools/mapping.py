@@ -166,9 +166,17 @@ def map_alignment_to_structure(
         # Nothing to map
         pass
     else:
+        # Normalise case: structure sequences are always uppercase; MSA rows
+        # from A3M-format alignments may contain lowercase insertion letters.
+        # Uppercase aln_seq for strategy selection and alignment so that the
+        # BLOSUM62 matrix (uppercase-only) scores correctly.
+        aln_seq_upper = aln_seq.upper()
+
         actual_strategy = strategy
         if strategy == "auto":
-            actual_strategy = "positional" if aln_seq == struct_seq else "align"
+            actual_strategy = (
+                "positional" if aln_seq_upper == struct_seq else "align"
+            )
 
         if actual_strategy == "positional":
             if len(aln_seq) != n_ca:
@@ -184,7 +192,7 @@ def map_alignment_to_structure(
 
         else:  # "align"
             result_msa = _align(
-                aln_seq, struct_seq,
+                aln_seq_upper, struct_seq,
                 mode="global",
                 seq1_id="query",
                 seq2_id="struct",
@@ -193,9 +201,12 @@ def map_alignment_to_structure(
             arr = result_msa._array  # shape (2, L_aln); row 0 = aln_seq, row 1 = struct
             aln_gap = "-"            # align() inserts '-' as gap
 
+            n_cols = len(cols)
             i = 0   # index into aln_seq ungapped residues → maps to cols[i]
             j = 0   # index into struct CA rows
             for ci in range(arr.shape[1]):
+                if i >= n_cols and j >= n_ca:
+                    break  # both sequences exhausted; nothing more to map
                 c0 = arr[0, ci]
                 c1 = arr[1, ci]
                 q_is_gap = (c0 == aln_gap)
@@ -203,7 +214,8 @@ def map_alignment_to_structure(
 
                 if not q_is_gap and not s_is_gap:
                     # Both ungapped → residue i of aln_seq ↔ CA row j
-                    out[cols[i]] = j
+                    if i < n_cols:
+                        out[cols[i]] = j
                     i += 1
                     j += 1
                 elif not q_is_gap:
