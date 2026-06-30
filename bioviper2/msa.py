@@ -90,7 +90,7 @@ class _IlocIndexer:
     def __init__(self, msa: "MSA"):
         self._msa = msa
 
-    def __getitem__(self, key) -> Union[str, pd.Series, pd.DataFrame]:
+    def __getitem__(self, key) -> Union[str, pd.Series, "MSA"]:
         if isinstance(key, tuple):
             row_key, col_key = key
         else:
@@ -120,10 +120,11 @@ class _IlocIndexer:
                 name=self._msa._columns[int(col_key)],
             )
 
-        return pd.DataFrame(
+        return self._msa._make_subset(
             row_data[:, col_key],
-            index=self._msa._index[row_key],
-            columns=self._msa._columns[col_key],
+            row_idx=self._msa._index[row_key],
+            col_idx=self._msa._columns[col_key],
+            row_int=row_key,
         )
 
 
@@ -175,7 +176,7 @@ class _LocIndexer:
     def __init__(self, msa: "MSA"):
         self._msa = msa
 
-    def __getitem__(self, key) -> Union[str, pd.Series, pd.DataFrame]:
+    def __getitem__(self, key) -> Union[str, pd.Series, "MSA"]:
         if isinstance(key, tuple):
             row_key, col_key = key
         else:
@@ -221,10 +222,11 @@ class _LocIndexer:
                 name=self._msa._columns[col_np],
             )
 
-        return pd.DataFrame(
+        return self._msa._make_subset(
             row_data[:, col_np],
-            index=row_idx,
-            columns=col_labels,
+            row_idx=row_idx,
+            col_idx=col_labels,
+            row_int=row_np,
         )
 
 
@@ -352,6 +354,24 @@ class MSA:
     @property
     def loc(self) -> _LocIndexer:
         return _LocIndexer(self)
+
+    def _make_subset(
+        self,
+        array: np.ndarray,
+        row_idx: pd.Index,
+        col_idx: pd.Index,
+        row_int,
+    ) -> "MSA":
+        """Build a new MSA from an array slice, preserving metadata/weights."""
+        new_msa = MSA(array, index=row_idx)
+        new_msa._columns = col_idx
+        if self.metadata is not None:
+            meta = self.metadata.iloc[row_int].copy()
+            meta.index = row_idx
+            new_msa.metadata = meta
+        if self._weights is not None:
+            new_msa._weights = self._weights[row_int].copy()
+        return new_msa
 
     # ------------------------------------------------------------------
     # Conversion
@@ -756,6 +776,16 @@ class MSA:
     # ------------------------------------------------------------------
     # Dunder
     # ------------------------------------------------------------------
+
+    def __getitem__(self, key) -> Union["MSA", pd.Series, str]:
+        """Row-selection shorthand delegating to .loc.
+
+        msa["seqA"]           → pd.Series (single sequence)
+        msa[["seqA", "seqB"]] → MSA subset
+        msa["seqA":"seqC"]    → MSA subset (inclusive slice of sequence IDs)
+        msa[0:5]              → use msa.iloc[0:5] for integer row slices
+        """
+        return self.loc[key]
 
     def __len__(self) -> int:
         return self.n_seqs
