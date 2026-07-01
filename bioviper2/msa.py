@@ -3,6 +3,13 @@ import numpy as np
 import pandas as pd
 from typing import Optional, Tuple, Union
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+#: Canonical 20 standard amino acids in alphabetical order.
+STANDARD_AMINO_ACIDS: str = "ACDEFGHIKLMNPQRSTVWY"
+
 
 # ---------------------------------------------------------------------------
 # PairwiseFrequencies — returned by MSA.pairwise_frequencies()
@@ -283,6 +290,17 @@ class MSA:
     @property
     def index(self) -> pd.Index:
         return self._index
+
+    @index.setter
+    def index(self, new_index) -> None:
+        idx = pd.Index(new_index)
+        if len(idx) != self.n_seqs:
+            raise ValueError(
+                f"index length {len(idx)} does not match n_seqs {self.n_seqs}"
+            )
+        self._index = idx
+        if self.metadata is not None:
+            self.metadata.index = idx
 
     @property
     def column_index(self) -> pd.Index:
@@ -699,6 +717,142 @@ class MSA:
 
         return pd.DataFrame(identity, index=self._index, columns=self._index)
 
+    def pairwise_distance(
+        self,
+        matrix="blosum62",
+        gap_chars=("-", "."),
+        mem_limit_mb: int = 512,
+    ) -> pd.DataFrame:
+        """Pairwise sequence distance using a substitution matrix.
+
+        For each pair (i, j):
+
+        .. code-block:: text
+
+            distance = 1 - S_ij / sqrt(S_ii|j * S_jj|i)
+
+        where S_ij is the sum of substitution scores over columns where *both*
+        sequences are non-gap, and S_ii|j (resp. S_jj|i) is the sum of
+        *self-scores* of sequence i (resp. j) restricted to those same shared
+        non-gap columns.  Dividing numerator and denominator by the shared
+        non-gap count cancels, so the metric is length-independent.
+
+        The cross-score is computed via the eigendecomposition of *S* —
+        one BLAS matmul per eigenvalue, the same count as
+        :meth:`pairwise_identity` has per unique character.
+
+        Parameters
+        ----------
+        matrix : str or dict or (alphabet, ndarray) tuple
+            Substitution matrix.  ``"blosum62"`` (default).  Accepts any
+            format understood by :func:`bioviper2.matrices.as_array`:
+
+            - ``str``  — built-in name: ``"blosum62"`` or ``"nuc"``.
+            - ``dict`` — flat ``(char_a, char_b) -> score`` mapping;
+              symmetric, or with only one ordering (the reverse is inferred).
+            - ``tuple[list[str], np.ndarray]`` — ``(alphabet, S)`` where
+              *S* is a square symmetric numeric array.
+
+        gap_chars : characters treated as gaps (excluded from scoring).
+            Characters present in the alignment but absent from the matrix
+            alphabet are also treated as gaps (a warning is emitted).
+        mem_limit_mb : approximate peak memory budget for column chunks, MB.
+
+        Returns
+        -------
+        pd.DataFrame of shape (n_seqs, n_seqs), float32, indexed by sequence
+        ID.  Diagonal is 0.0.  NaN where a pair shares no non-gap positions.
+        Values can exceed 1.0 for pairs more dissimilar than random background
+        (BLOSUM62 cross-scores go negative).  Symmetric by construction.
+        """
+        from .matrices import as_array
+
+        n, L = self.shape
+        gap_set = set(gap_chars)
+
+        result_gb = n * n * 4 / 1024 ** 3
+        if result_gb > 2:
+            warnings.warn(
+                f"Result matrix will occupy ~{result_gb:.1f} GB. "
+                "Consider subsetting first.",
+                stacklevel=2,
+            )
+
+        # Resolve substitution matrix -> sorted alphabet + (A, A) float32 array
+        alphabet, S = as_array(matrix, gap_chars=tuple(gap_chars))
+        A = len(alphabet)
+        char_to_idx: dict = {c: i for i, c in enumerate(alphabet)}
+
+        # Warn about MSA characters that are absent from the matrix alphabet
+        all_chars = {c for c in np.unique(self._array) if c not in gap_set}
+        unknown = all_chars - set(alphabet)
+        if unknown:
+            warnings.warn(
+                f"Characters {sorted(unknown)!r} are not in the substitution "
+                f"matrix and will be treated as gaps.",
+                stacklevel=2,
+            )
+
+        # Eigendecompose S = V diag(lam) V^T (eigh: real symmetric, stable)
+        lam, V = np.linalg.eigh(S.astype(np.float64))
+        lam = lam.astype(np.float32)  # (A,) ascending
+        V   = V.astype(np.float32)    # (A, A), V[:, k] = k-th eigenvector
+
+        # Diagonal self-scores S[a, a] for each residue in the alphabet
+        self_scores = np.diag(S)  # (A,) float32
+
+        # Column chunk size (same budget model as pairwise_identity)
+        bytes_per_col = 13 * n
+        l_chunk = max(1, (mem_limit_mb * 1024 * 1024) // bytes_per_col)
+        l_chunk = min(l_chunk, L)
+
+        num    = np.zeros((n, n), dtype=np.float32)  # Σ_l S[res_i(l), res_j(l)]
+        si_acc = np.zeros((n, n), dtype=np.float32)  # Σ_l S[res_i(l), res_i(l)] on shared cols
+        denom  = np.zeros((n, n), dtype=np.float32)  # count of shared non-gap cols
+
+        for l_start in range(0, L, l_chunk):
+            chunk = self._array[:, l_start : l_start + l_chunk]  # (n, cl) U1
+            cl = chunk.shape[1]
+
+            # Residue codes: -1 for gap or out-of-alphabet characters
+            codes = np.full((n, cl), -1, dtype=np.int16)
+            for c, ci in char_to_idx.items():
+                codes[chunk == c] = ci
+
+            valid = codes >= 0                  # (n, cl) bool: in-matrix non-gap
+            safe  = np.where(valid, codes, 0)   # (n, cl) int16, dummy 0 at gaps
+
+            in_mat = valid.astype(np.float32)   # 1.0 where valid, 0 elsewhere
+            denom += in_mat @ in_mat.T
+
+            # Self-scores: S[a, a] for each residue; 0 at gaps/unknowns
+            ss = np.where(valid, self_scores[safe], 0.0).astype(np.float32)
+            # si_acc[i,j] = Σ_l ss[i,l] * in_mat[j,l]
+            #   = self-scores of row-seq i on cols where col-seq j is valid
+            si_acc += ss @ in_mat.T
+
+            # Cross-score via eigendecomposition:
+            # num[i,j] += Σ_k lam_k (Y_k @ Y_k^T)[i,j]
+            # Y_k[i,l] = V[res_i(l), k] * in_mat[i,l]  (0 at gaps)
+            for k in range(A):
+                Yk = np.where(valid, V[safe, k], 0.0).astype(np.float32)
+                num += lam[k] * (Yk @ Yk.T)
+
+        # norm_sim[i,j] = num[i,j] / sqrt(si_acc[i,j] * si_acc[j,i])
+        # si_acc[j,i] = sj_acc[i,j] (transposed), so si_acc.T gives the j self-scores
+        with np.errstate(invalid="ignore", divide="ignore"):
+            norm_denom = np.sqrt(si_acc * si_acc.T)
+            sim = np.where(
+                (denom > 0) & (norm_denom > 0),
+                num / norm_denom,
+                np.nan,
+            )
+
+        distance = (1.0 - sim).astype(np.float32)
+        np.fill_diagonal(distance, 0.0)
+
+        return pd.DataFrame(distance, index=self._index, columns=self._index)
+
     def compute_weights(
         self,
         threshold: float = 0.8,
@@ -806,3 +960,141 @@ class MSA:
             f"MSA({self.n_seqs} sequences × {self.n_positions} positions"
             f"{col_info}{meta_info}{weight_info})"
         )
+
+
+# ---------------------------------------------------------------------------
+# Module-level utilities
+# ---------------------------------------------------------------------------
+
+
+def one_hot_encode_msa(
+    msa,
+    alphabet="standard",
+    include_gap: bool = False,
+    gap_chars=("-", "."),
+    as_array: bool = False,
+    dtype=np.float32,
+):
+    """One-hot encode every position of an MSA.
+
+    Unlike ``pd.get_dummies()``, this function uses a **fixed alphabet** by
+    default (the 20 standard amino acids), so encodings from different MSAs
+    that share the same alignment columns are directly comparable — no missing
+    columns for residues that happen to be absent from a particular MSA.
+
+    Parameters
+    ----------
+    msa : MSA
+        The alignment to encode.
+    alphabet : {"standard", "present"} or sequence of str, default ``"standard"``
+        Which symbols to encode:
+
+        - ``"standard"`` — the 20 canonical amino acids in alphabetical order
+          (``ACDEFGHIKLMNPQRSTVWY``, see :data:`STANDARD_AMINO_ACIDS`).
+          Residues not in this set (e.g. ``X``, ``B``, gaps) produce an
+          all-zero vector at that position.
+        - ``"present"`` — only the non-gap characters that appear in *this*
+          MSA (sorted), equivalent to the ``pd.get_dummies`` behaviour.  Not
+          comparable to encodings of other MSAs unless their alphabets match.
+        - explicit sequence of single characters — e.g. ``["A", "C", "G", "T"]``
+          for a nucleotide MSA.  Must contain no duplicates.
+
+    include_gap : bool, default ``False``
+        If ``True``, append a gap category (labelled ``"-"``) after the
+        residue columns.  All characters in *gap_chars* map to this column;
+        non-gap residues outside the alphabet do **not** (they stay all-zero).
+    gap_chars : tuple of str, default ``("-", ".")``
+        Characters treated as gaps.  Relevant both for ``alphabet="present"``
+        (they are excluded from the inferred alphabet) and for ``include_gap``.
+    as_array : bool, default ``False``
+        If ``True``, return a ``(array, alphabet_list)`` tuple instead of a
+        DataFrame.  *array* has shape ``(n_seqs, n_positions, A)`` where *A*
+        is the alphabet size (including the gap column if *include_gap*).
+    dtype : numpy dtype, default ``np.float32``
+        Element type of the output array / DataFrame values.
+
+    Returns
+    -------
+    pd.DataFrame
+        Shape ``(n_seqs, n_positions × A)``.  Row index = sequence IDs.
+        Columns = ``pd.MultiIndex`` with levels ``("position", "residue")``,
+        where *position* comes from ``msa.column_index`` (integers by default).
+        Column order is **position-major, residue-minor**, so
+        ``df.to_numpy().reshape(n_seqs, n_positions, A)`` recovers the 3-D
+        array.
+    or (np.ndarray, list[str])
+        When ``as_array=True``: a tuple of the ``(n, L, A)`` encoding array
+        and the flat alphabet list (including ``"-"`` at the end if
+        ``include_gap=True``).
+
+    Notes
+    -----
+    Memory scales as ``O(n_seqs × n_positions × A)``.  For very long
+    alignments against large alphabets, consider subsetting positions first.
+
+    Examples
+    --------
+    >>> df = bv.one_hot_encode_msa(msa)              # 20-AA, no gaps
+    >>> df = bv.one_hot_encode_msa(msa, include_gap=True)   # 21 channels
+    >>> df = bv.one_hot_encode_msa(msa, alphabet="present") # get_dummies style
+    >>> arr, alph = bv.one_hot_encode_msa(msa, as_array=True)  # (n, L, 20) array
+    """
+    if not isinstance(msa, MSA):
+        raise TypeError(
+            f"msa must be an MSA instance; got {type(msa).__name__}."
+        )
+
+    gap_set = set(gap_chars)
+
+    # ---- Resolve alphabet --------------------------------------------------
+    if isinstance(alphabet, str):
+        if alphabet == "standard":
+            symbols = list(STANDARD_AMINO_ACIDS)
+        elif alphabet == "present":
+            symbols = sorted(
+                c for c in np.unique(msa._array) if c not in gap_set
+            )
+        else:
+            raise ValueError(
+                f"alphabet string must be 'standard' or 'present'; "
+                f"got {alphabet!r}."
+            )
+    else:
+        # Explicit sequence of characters
+        symbols = list(alphabet)
+        if any(len(c) != 1 for c in symbols):
+            raise ValueError(
+                "Each entry in a custom alphabet must be a single character."
+            )
+        if len(symbols) != len(set(symbols)):
+            raise ValueError("Custom alphabet contains duplicate characters.")
+
+    if include_gap:
+        full_alphabet = symbols + ["-"]
+    else:
+        full_alphabet = symbols
+
+    A = len(full_alphabet)
+    n, L = msa.shape
+
+    # ---- Build (n, L, A) encoding -----------------------------------------
+    arr = msa._array          # (n, L) U1
+    encoding = np.zeros((n, L, A), dtype=dtype)
+
+    for k, sym in enumerate(symbols):
+        encoding[:, :, k] = (arr == sym).astype(dtype)
+
+    if include_gap:
+        encoding[:, :, -1] = np.isin(arr, list(gap_chars)).astype(dtype)
+
+    # ---- Return ------------------------------------------------------------
+    if as_array:
+        return encoding, full_alphabet
+
+    # MultiIndex columns: position-major, residue-minor
+    col_mi = pd.MultiIndex.from_product(
+        [msa._columns, full_alphabet],
+        names=["position", "residue"],
+    )
+    flat = encoding.reshape(n, L * A)
+    return pd.DataFrame(flat, index=msa._index, columns=col_mi)

@@ -1,4 +1,4 @@
-from .msa import MSA
+from .msa import MSA, one_hot_encode_msa, STANDARD_AMINO_ACIDS
 from .structure import Structure, DistanceMatrix
 from .io import (
     read, write,
@@ -22,6 +22,8 @@ from .tools import (
 
 __all__ = [
     "MSA",
+    "one_hot_encode_msa",
+    "STANDARD_AMINO_ACIDS",
     "Structure",
     "DistanceMatrix",
     "read", "write",
